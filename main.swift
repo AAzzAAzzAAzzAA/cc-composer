@@ -48,17 +48,16 @@ let pngSizeLimit = 1_500_000                         // PNG 超过这个大小�
 let historyLimit = 100                               // ↑ 能翻到的消息条数
 let draftAttachmentMaxAge: TimeInterval = 6 * 86400  // 草稿里的附件放久了就不恢复（VPS 那边 7 天清理）
 let commandsRefreshInterval: TimeInterval = 600      // 命令表（含新装的 skill）多久从 VPS 刷新一次
+let remoteDir = "$HOME/.cache/cc-composer"            // 远程机器上存图片和文件的目录，只放本应用传的东西，超过 7 天的自动清理
 
 /// 配置文件 ~/.config/cc-composer/config：一行一个 key = value，# 开头的是注释。每次用到时现读，改了不用重启
-///   ssh_host = myvps                   连远程机器用的 SSH 主机名或别名，要能免密登录。图片、文件、命令表、会话列表都靠它
-///   remote_dir = ~/.cache/cc-composer  远程机器上存图片和文件的目录（可选），超过 7 天的自动清理
-///   label.my-skill = 我的 skill        给命令加中文说明（可选，可以写多行；也能覆盖自带的说明）
+///   ssh_host = myvps              连远程机器用的 SSH 主机名或别名，要能免密登录。图片、文件、命令表、会话列表都靠它
+///   label.my-skill = 我的 skill   给命令加中文说明（可选，可以写多行；也能覆盖自带的说明）
 struct Config {
     static let path = NSHomeDirectory() + "/.config/cc-composer/config"
     static let missingHost = "还没设置远程机器：在 ~/.config/cc-composer/config 里写一行 ssh_host = 你的 SSH 主机"
 
     var sshHost = ""
-    var remoteDir = "$HOME/.cache/cc-composer"
     var labels: [String: String] = [:]
 
     static func load() -> Config {
@@ -75,7 +74,6 @@ struct Config {
             if let comment = value.range(of: " #") { value = value[..<comment.lowerBound].trimmingCharacters(in: .whitespaces) }
             switch key {
             case "ssh_host": config.sshHost = value
-            case "remote_dir": config.remoteDir = value.hasPrefix("~/") ? "$HOME/" + value.dropFirst(2) : value
             default: if key.hasPrefix("label.") { config.labels[String(key.dropFirst(6))] = value }
             }
         }
@@ -346,22 +344,35 @@ enum ImageUploader {
         return "\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(6).lowercased())"
     }
 
-    /// 文件名会拼进远端的 shell 命令（双引号里），去掉会被 shell 解释的字符；空格也换掉，路径贴给 Claude 时不会断开
+    /// 远端文件名：斜杠、引号、空白、控制字符换成 _，路径贴给 Claude 时不会断开或被误解。
+    /// 按 Unicode 码点逐个查（按字符查的话，引号后面跟一个组合符号就成了一个“字符”，会漏掉）。
+    /// 文件名本身不会进 shell 源码，见 uploadScript
     static func safeName(_ name: String) -> String {
-        let unsafe = Set("\"$`\\/")
-        let cleaned = String(name.map { unsafe.contains($0) || $0.isWhitespace || $0.unicodeScalars.contains { $0.properties.generalCategory == .control } ? "_" : $0 })
+        let unsafe: Set<Unicode.Scalar> = ["\"", "'", "$", "`", "\\", "/"]
+        var scalars = String.UnicodeScalarView()
+        for scalar in name.unicodeScalars {
+            let bad = unsafe.contains(scalar) || scalar.properties.isWhitespace || scalar.properties.generalCategory == .control
+            scalars.append(bad ? "_" : scalar)
+        }
+        let cleaned = String(scalars)
         return cleaned.isEmpty || cleaned == "." || cleaned == ".." ? "file" : cleaned
     }
 
-    private static func run(remotePath: String, input: FileHandle, afterLaunch: () -> Void) -> Result<String, UploadError> {
-        // 先清理 7 天前的文件和空目录（目录要放了一小时以上才删，免得删掉别的上传刚建好的），再写入
-        let config = Config.load()
-        guard !config.sshHost.isEmpty else { return .failure(UploadError(message: Config.missingHost)) }
-        let script = """
-            d="\(config.remoteDir)"; f="$d/\(remotePath)"; mkdir -p "$d" && \
+    /// 在远端执行的上传脚本。路径用 base64 传过去再解码成变量，不管文件名里有什么，shell 都只把它当数据。
+    /// 先清理 7 天前的文件和空目录（目录要放了一小时以上才删，免得删掉别的上传刚建好的），再写入
+    static func uploadScript(remotePath: String) -> String {
+        let encoded = Data(remotePath.utf8).base64EncodedString()
+        return """
+            d="\(remoteDir)"; f="$d/$(printf %s '\(encoded)' | base64 -d)"; mkdir -p "$d" && \
             find "$d" -type f -mtime +7 -delete; find "$d" -mindepth 1 -type d -empty -mmin +60 -delete 2>/dev/null; \
             mkdir -p "$(dirname "$f")" && cat > "$f" && printf %s "$f"
             """
+    }
+
+    private static func run(remotePath: String, input: FileHandle, afterLaunch: () -> Void) -> Result<String, UploadError> {
+        let config = Config.load()
+        guard !config.sshHost.isEmpty else { return .failure(UploadError(message: Config.missingHost)) }
+        let script = uploadScript(remotePath: remotePath)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         // ControlMaster=no：有预热好的连接就复用，没有就单独连一次。
@@ -390,9 +401,10 @@ enum ImageUploader {
 
 @MainActor
 final class GhosttyBridge {
+    static let shared = GhosttyBridge()
     private let script: NSAppleScript
 
-    init() {
+    private init() {
         script = NSAppleScript(source: """
             on targetinfo()
                 tell application "Ghostty"
@@ -406,10 +418,14 @@ final class GhosttyBridge {
                     try
                         return first terminal whose id is tid
                     on error
-                        return focused terminal of selected tab of front window
+                        error "terminal closed" number 4242
                     end try
                 end tell
             end findterm
+
+            on alltermids()
+                tell application "Ghostty" to return id of every terminal
+            end alltermids
 
             on sendmessage(tid, imgs, txt, submit, gap)
                 set t to findterm(tid)
@@ -428,8 +444,10 @@ final class GhosttyBridge {
             end sendmessage
 
             on focusterm(tid)
-                set t to findterm(tid)
-                tell application "Ghostty" to focus t
+                try
+                    set t to findterm(tid)
+                    tell application "Ghostty" to focus t
+                end try
             end focusterm
             """)!
         var err: NSDictionary?
@@ -446,7 +464,15 @@ final class GhosttyBridge {
         return (id, r.atIndex(2)?.stringValue ?? "")
     }
 
-    /// images 是空格分隔的图片路径，单独粘贴一次；text 再粘贴一次。成功返回 nil，失败返回错误信息
+    /// 所有终端（含分屏）的编号。拿不到（Ghostty 没开、没授权）时返回 nil
+    func terminalIDs() -> Set<String>? {
+        guard ghosttyRunning, case .success(let r) = call("alltermids", []) else { return nil }
+        guard r.descriptorType == typeAEList else { return r.stringValue.map { [$0] } ?? [] }
+        return Set((0..<r.numberOfItems).compactMap { r.atIndex($0 + 1)?.stringValue })
+    }
+
+    /// images 是空格分隔的图片路径，单独粘贴一次；text 再粘贴一次。成功返回 nil，失败返回错误信息。
+    /// 只发给 tid 这个终端，它已经关了就报错，不会换成别的终端
     func send(images: String, text: String, to tid: String, submit: Bool) -> String? {
         guard ghosttyRunning else { return "Ghostty 没有在运行" }
         let args: [NSAppleEventDescriptor] = [
@@ -481,6 +507,9 @@ final class GhosttyBridge {
         var err: NSDictionary?
         let result = script.executeAppleEvent(event, error: &err)
         if let err {
+            if (err[NSAppleScript.errorNumber] as? Int) == 4242 {
+                return .failure("原来的终端已经关了，没有发出去")
+            }
             if (err[NSAppleScript.errorNumber] as? Int) == -1743 {
                 return .failure("没有控制 Ghostty 的权限：系统设置 → 隐私与安全性 → 自动化 → cc-composer → 打开 Ghostty")
             }
@@ -725,14 +754,44 @@ enum Store {
         var items: [Item]
     }
 
+    /// 一个终端（含分屏）的草稿和发过的消息（↑ 翻的就是这些）
+    struct TerminalState: Codable {
+        var draft = Draft(text: "", items: [])
+        var history: [String] = []
+    }
+
     nonisolated(unsafe) static var directory = URL(fileURLWithPath: NSHomeDirectory())
         .appendingPathComponent("Library/Application Support/cc-composer")
     private static var thumbnails: URL { directory.appendingPathComponent("thumbnails") }
+    private static var terminals: URL { directory.appendingPathComponent("terminals") }
 
-    static func loadDraft() -> Draft? { load(Draft.self, "draft.json") }
-    static func saveDraft(_ draft: Draft) { save(draft, "draft.json") }
-    static func loadHistory() -> [String] { load([String].self, "history.json") ?? [] }
-    static func saveHistory(_ history: [String]) { save(history, "history.json") }
+    /// terminals/<终端编号>.json。编号是 Ghostty 给的 UUID；拿不到编号（没授权时）存成 unknown
+    private static func terminalFile(_ id: String) -> String {
+        let safe = String(id.unicodeScalars.filter { $0.isASCII && ($0.properties.isAlphabetic || ("0"..."9").contains($0) || $0 == "-") })
+        return "terminals/\(safe.isEmpty ? "unknown" : safe).json"
+    }
+
+    static func loadTerminal(_ id: String) -> TerminalState? { load(TerminalState.self, terminalFile(id)) }
+    static func saveTerminal(_ id: String, _ state: TerminalState) { save(state, terminalFile(id)) }
+    static func deleteTerminal(_ id: String) { try? FileManager.default.removeItem(at: directory.appendingPathComponent(terminalFile(id))) }
+
+    static func storedTerminalIDs() -> [String] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: terminals.path)) ?? [])
+            .filter { $0.hasSuffix(".json") }.map { String($0.dropLast(5)) }
+    }
+
+    /// 旧版（所有终端共用一份）的草稿和历史：交给升级后第一个打开输入框的终端，然后删掉
+    static func takeLegacy() -> TerminalState? {
+        let draft = load(Draft.self, "draft.json"), history = load([String].self, "history.json")
+        guard draft != nil || history != nil else { return nil }
+        for name in ["draft.json", "history.json"] { try? FileManager.default.removeItem(at: directory.appendingPathComponent(name)) }
+        return TerminalState(draft: draft ?? Draft(text: "", items: []), history: history ?? [])
+    }
+
+    static func legacyForTest(draft: Draft, history: [String]) {
+        save(draft, "draft.json")
+        save(history, "history.json")
+    }
     static func loadCommandUsage() -> [String: Int] { load([String: Int].self, "command-usage.json") ?? [:] }
     static func saveCommandUsage(_ usage: [String: Int]) { save(usage, "command-usage.json") }
 
@@ -747,8 +806,9 @@ enum Store {
         NSImage(contentsOf: thumbnails.appendingPathComponent(name))
     }
 
-    /// 删掉草稿里已经不用的图片。刚存一分钟内的不删：可能是还在上传、还没记进附件的
-    static func pruneThumbnails(keeping names: Set<String>) {
+    /// 删掉所有终端的草稿都不再用的图片。刚存一分钟内的不删：可能是还在上传、还没记进附件的
+    static func pruneThumbnails() {
+        let names = Set(storedTerminalIDs().compactMap(loadTerminal).flatMap { $0.draft.items.compactMap(\.thumbnail) })
         let files = (try? FileManager.default.contentsOfDirectory(atPath: thumbnails.path)) ?? []
         for file in files where !names.contains(file) {
             let url = thumbnails.appendingPathComponent(file)
@@ -769,8 +829,9 @@ enum Store {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
         guard let data = try? encoder.encode(value) else { return }
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try? data.write(to: directory.appendingPathComponent(file), options: .atomic)
+        let url = directory.appendingPathComponent(file)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
     }
 }
 
@@ -1208,6 +1269,66 @@ enum SessionList {
         }
         formatter.dateFormat = "M月d日 HH:mm"
         return formatter.string(from: date)
+    }
+}
+
+/// 命令表、会话列表、命令使用次数：所有输入框共用一份，取到新的就通知各个输入框
+@MainActor
+final class CommandState {
+    static let shared = CommandState()
+    private(set) var commands = CommandCatalog.load()
+    private(set) var usage = Store.loadCommandUsage()  // 每个命令发过几次，只打 / 时常用的排前面
+    private(set) var sessions: [SlashOption] = []       // /resume 后面列的会话
+    private var sessionsFetched = Date.distantPast
+    private var fetchingCommands = false
+    private var fetchingSessions = false
+    var onChange: (() -> Void)?
+
+    /// 补全用的命令表：/resume 的选项换成会话列表
+    var catalog: [SlashCommand] {
+        var catalog = commands
+        if let resume = catalog.firstIndex(where: { $0.name == "resume" }) { catalog[resume].options = sessions }
+        return catalog
+    }
+
+    func used(_ name: String) {
+        usage[name, default: 0] += 1
+        Store.saveCommandUsage(usage)
+    }
+
+    /// 命令表过期了（或从没取过）就在后台从 VPS 取一次，取到后马上换上
+    func refreshCommands() {
+        guard CommandCatalog.isStale, !fetchingCommands else { return }
+        fetchingCommands = true
+        Task.detached {
+            let result = CommandCatalog.fetch()
+            await MainActor.run {
+                self.fetchingCommands = false
+                if case .failure(let error) = result { NSLog("commands: %@", error.message); return }
+                self.commands = CommandCatalog.load()
+                self.onChange?()
+            }
+        }
+    }
+
+    /// 会话列表每次打开输入框都在后台取一次（很快）；打到 /resume 时超过 20 秒没取也再取
+    func refreshSessions(ifOlderThan age: TimeInterval = 0) {
+        guard !fetchingSessions, Date().timeIntervalSince(sessionsFetched) > age else { return }
+        fetchingSessions = true
+        Task.detached {
+            let result = SessionList.fetch()
+            await MainActor.run {
+                self.fetchingSessions = false
+                switch result {
+                case .success(let sessions):
+                    self.sessions = sessions
+                    self.sessionsFetched = Date()
+                    self.onChange?()
+                case .failure(let error):
+                    NSLog("sessions: %@", error.message)
+                }
+            }
+        }
     }
 }
 
@@ -1676,15 +1797,20 @@ enum Layout {
     }
 }
 
+/// 一个终端（含分屏）的输入框：草稿、历史、附件、等上传的发送都只属于这个终端。由 ComposerHub 创建和调度
 @MainActor
 final class Composer: NSObject, NSTextViewDelegate, DropHandler {
-    private let bridge = GhosttyBridge()
+    private let bridge = GhosttyBridge.shared
+    let targetID: String  // 这个输入框对应的 Ghostty 终端编号，只往这里发
+    var onStateChange: (() -> Void)?  // 焦点、打开收起、跟随时通知 ComposerHub（决定 Esc 拦不拦）
+    private var monitors: [Any] = []
+    private var observers: [NSObjectProtocol] = []
+    private var discarded = false
     private let panel: ComposerPanel
     private let card = CardView()
     private let scroll = NSScrollView()
     private let textView = ComposerTextView(frame: NSRect(x: 0, y: 0, width: Layout.fallbackWidth, height: 40))
-    private var escKey: HotKey!  // 输入框开着但焦点在终端时，拦下 Esc 只收起输入框
-    private var history = Store.loadHistory()
+    private var history: [String] = []
     private var historyIndex: Int?  // nil：正在写自己的草稿；否则正显示 history[historyIndex]
     private var historyStash = ""    // 开始翻历史前正在写的内容，翻回来时还原
     private var showingHistory = false
@@ -1692,17 +1818,11 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
     private var hintIsError = false
     private let imagePreview = ImagePreview()
     /// 用户打开了输入框、还没收起或发送。打开期间它跟着 Ghostty 窗口走
-    private var isOpen = false
+    private(set) var isOpen = false
     private let dropZone = DropZone()
     private var seenDragCount = NSPasteboard(name: .drag).changeCount  // 已经看过的那次拖动
     private var releasedTicks = 0
     private let completion = CompletionPopup()
-    private var commands = CommandCatalog.load()
-    private var fetchingCommands = false
-    private var commandUsage = Store.loadCommandUsage()  // 每个命令发过几次，只打 / 时常用的排前面
-    private var sessions: [SlashOption] = []              // /resume 后面列的会话
-    private var sessionsFetched = Date.distantPast
-    private var fetchingSessions = false
     private var completionDismissed = false  // Esc 关掉了列表，或文字是翻历史带出来的：再改文字（或按 Tab）之前不弹
     private var minimizePressed = false  // 正按着 Ghostty 窗口的最小化按钮：先藏起来，免得窗口缩进程序坞时它还悬在原处
     private let prompt = NSTextField(labelWithString: "›")
@@ -1714,18 +1834,21 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
     private var attachments: [Attachment] = []
     private var pendingSubmit: Bool?  // 图片还没传完时按了发送：传完后按这个值自动发
     private var look = GhosttyLook()
-    private var targetID = ""
     private var targetName = ""
-    private var windowID: CGWindowID?
+    private(set) var windowID: CGWindowID?
     private var followTimer: Timer?
 
-    override init() {
+    var isFocused: Bool { panel.isVisible && panel.isKeyWindow }
+    /// 开着但焦点在终端（变暗的状态）：这时在终端里按 Esc 只收起它
+    var isUnfocused: Bool { panel.isVisible && !panel.isKeyWindow && !imagePreview.isVisible }
+
+    init(terminalID: String, state: Store.TerminalState?) {
+        targetID = terminalID
         panel = ComposerPanel(
             contentRect: NSRect(x: 0, y: 0, width: Layout.fallbackWidth, height: 100),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false)
         super.init()
-        escKey = HotKey(id: 2, keyCode: escKeyCode, modifiers: 0) { [weak self] in self?.dismiss() }
 
         panel.isFloatingPanel = true
         panel.level = .floating
@@ -1813,24 +1936,36 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
         ])
 
         apply(look)
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
             guard let self, event.window === self.panel else { return event }
             return self.handleShortcut(event) ? nil : event
-        }
+        }) { monitors.append(monitor) }
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
-            NotificationCenter.default.addObserver(forName: name, object: panel, queue: .main) { [weak self] _ in
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: panel, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.focusChanged() }
-            }
+            })
         }
         // 看别的应用里的鼠标拖动（只看鼠标，不需要额外权限）：有文件被拖起来就在 Ghostty 窗口上铺接收层
-        NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDragged) { [weak self] _ in
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDragged, handler: { [weak self] _ in
             MainActor.assumeIsolated { self?.mouseDragged() }
-        }
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
+        }) { monitors.append(monitor) }
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp], handler: { [weak self] event in
             let down = event.type == .leftMouseDown
             MainActor.assumeIsolated { self?.mouseClicked(down: down) }
-        }
-        restoreDraft()
+        }) { monitors.append(monitor) }
+        restore(state)
+    }
+
+    /// 终端已经关了：收起，草稿和历史一起删掉，不再响应任何事件
+    func discard() {
+        close()
+        discarded = true
+        pendingSubmit = nil
+        monitors.forEach(NSEvent.removeMonitor)
+        monitors.removeAll()
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers.removeAll()
+        Store.deleteTerminal(targetID)
     }
 
     /// 最小化按钮（红黄绿里的黄色）中心离 Ghostty 窗口左上角的距离，按截图量的；半宽 8 点，碰不到旁边两个按钮
@@ -1894,12 +2029,11 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
     /// 焦点在输入框里时 Esc 由输入框自己处理，输入法用 Esc 取消选字也不受影响。
     /// 只在 Ghostty 处于前台时拦，切到别的应用后 Esc 照常；看大图时 Esc 交给预览
     private func focusChanged() {
-        let unfocused = panel.isVisible && !panel.isKeyWindow && !imagePreview.isVisible
-        let ghosttyActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == ghosttyBundleID
+        let unfocused = isUnfocused
         card.alphaValue = unfocused ? 0.6 : 1
         if unfocused { completion.hide() }
-        if unfocused && ghosttyActive { escKey.register() } else { escKey.unregister() }
         if !hintIsError { refreshHint() }
+        onStateChange?()
     }
 
     /// 前台应用变了（AppDelegate 通知）：马上调整层级和 Esc，不用等下一次跟随
@@ -1908,26 +2042,15 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
         focusChanged()
     }
 
-    /// 首次运行时触发一次“自动化”授权弹窗（Ghostty 没开就跳过，免得把它拉起来）
-    func warmUp() {
-        _ = bridge.targetInfo()
-    }
-
-    func toggle() {
-        if panel.isVisible && panel.isKeyWindow { dismiss() } else { present() }
-    }
-
-    func present() {
+    /// 打开（name 是终端标题，显示在右下角）
+    func present(name: String) {
         // 从菜单栏打开时 Ghostty 可能被挡在后面，先把它叫到前面
         let fromBackground = NSWorkspace.shared.frontmostApplication?.bundleIdentifier != ghosttyBundleID
-        if let info = bridge.targetInfo() {
-            targetID = info.id
-            targetName = info.name
-        }
+        targetName = name
         if fromBackground && !targetID.isEmpty { bridge.focus(targetID) }
         ImageUploader.warmUp()  // 先把到 VPS 的连接建好，贴图时就不用再等 3~4 秒握手
-        refreshCommands()
-        refreshSessions()
+        CommandState.shared.refreshCommands()
+        CommandState.shared.refreshSessions()
 
         apply(GhosttyLook.load())
         refreshHint()
@@ -1956,9 +2079,11 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
         if !targetID.isEmpty { bridge.focus(targetID) }
     }
 
-    /// 收起（草稿保留），不动键盘焦点：发送时、Ghostty 窗口被关掉时
+    /// 收起（草稿保留），不动键盘焦点：发送时、Ghostty 窗口被关掉时、同一窗口换到别的分屏的输入框时。
+    /// 等附件传完再自动发的那次发送也取消（不然收起后、甚至换了终端还会自己发出去）
     func close() {
         isOpen = false
+        pendingSubmit = nil
         stopFollowing()
         imagePreview.close()
         dropZone.hide()
@@ -1981,6 +2106,7 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
         completion.place()  // 输入框换了层级或位置，候选列表跟着
         if NSEvent.pressedMouseButtons & 1 != 0 { mouseDragged() }  // 万一拖动事件没转过来，按着左键时也查一次
         hideDropZoneAfterRelease()
+        onStateChange?()  // 前台换了别的 Ghostty 窗口时，Esc 要不要拦也跟着变
     }
 
     /// 这个 Ghostty 窗口在最前面时浮在最上层；切到别的应用或别的 Ghostty 窗口时，排到这个窗口正上方：
@@ -2102,10 +2228,9 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
     private func updateCompletion() {
         guard !textView.hasMarkedText() else { return }  // 输入法还在选字，先不动
         let wasShown = completion.isShown
-        if textView.string.hasPrefix("/resume ") && Date().timeIntervalSince(sessionsFetched) > 20 { refreshSessions() }
-        var catalog = commands
-        if let resume = catalog.firstIndex(where: { $0.name == "resume" }) { catalog[resume].options = sessions }
-        let items = completionDismissed ? [] : SlashCompleter.suggestions(for: textView.string, in: catalog, usage: commandUsage)
+        let state = CommandState.shared
+        if textView.string.hasPrefix("/resume ") { state.refreshSessions(ifOlderThan: 20) }
+        let items = completionDismissed ? [] : SlashCompleter.suggestions(for: textView.string, in: state.catalog, usage: state.usage)
         if items.isEmpty { completion.hide() } else { completion.show(items, above: panel, look: look) }
         if wasShown != completion.isShown && !hintIsError { refreshHint() }
     }
@@ -2132,39 +2257,9 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
         return true
     }
 
-    /// 会话列表每次打开输入框都在后台取一次（很快），打到 /resume 时超过 20 秒没取也再取
-    private func refreshSessions() {
-        guard !fetchingSessions else { return }
-        fetchingSessions = true
-        Task.detached {
-            let result = SessionList.fetch()
-            await MainActor.run {
-                self.fetchingSessions = false
-                switch result {
-                case .success(let sessions):
-                    self.sessions = sessions
-                    self.sessionsFetched = Date()
-                    if self.textView.string.hasPrefix("/resume ") { self.updateCompletion() }
-                case .failure(let error):
-                    NSLog("sessions: %@", error.message)
-                }
-            }
-        }
-    }
-
-    /// 命令表过期了（或从没取过）就在后台从 VPS 取一次，取到后马上换上
-    private func refreshCommands() {
-        guard CommandCatalog.isStale, !fetchingCommands else { return }
-        fetchingCommands = true
-        Task.detached {
-            let result = CommandCatalog.fetch()
-            await MainActor.run {
-                self.fetchingCommands = false
-                if case .failure(let error) = result { NSLog("commands: %@", error.message); return }
-                self.commands = CommandCatalog.load()
-                if self.completion.isShown { self.updateCompletion() }
-            }
-        }
+    /// 命令表或会话列表刚更新：列表开着（或正打 /resume）就换上新的
+    func commandsChanged() {
+        if completion.isShown || textView.string.hasPrefix("/resume ") { updateCompletion() }
     }
 
     // MARK: 发送与按键
@@ -2174,7 +2269,7 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
         while text.last?.isNewline == true { text.removeLast() }
         let hasText = !text.allSatisfy(\.isWhitespace)
         // 斜杠命令只发命令本身，附件留在输入框里等下一条：路径拼在前面的话 Claude Code 就不当它是命令了
-        let command = hasText ? SlashCompleter.command(in: text, among: commands) : nil
+        let command = hasText ? SlashCompleter.command(in: text, among: CommandState.shared.commands) : nil
         let attachments = command == nil ? self.attachments : []
         guard hasText || !attachments.isEmpty else { NSSound.beep(); return }
         if attachments.contains(where: \.isFailed) {
@@ -2201,10 +2296,7 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
             return
         }
         if hasText { remember(text) }
-        if let command {
-            commandUsage[command.name, default: 0] += 1
-            Store.saveCommandUsage(commandUsage)
-        }
+        if let command { CommandState.shared.used(command.name) }
         // 清空草稿但保留撤销记录：发错了可以 ⌘Z 找回文字（附件不会回来）
         let all = NSRange(location: 0, length: (textView.string as NSString).length)
         if textView.shouldChangeText(in: all, replacementString: "") {
@@ -2227,7 +2319,7 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
     private func remember(_ text: String) {
         if history.last != text { history.append(text) }
         if history.count > historyLimit { history.removeFirst(history.count - historyLimit) }
-        Store.saveHistory(history)
+        saveDraftNow()
     }
 
     /// ↑/↓：光标在第一行（↑）或最后一行（↓）时翻历史，否则返回 false 照常移动光标。
@@ -2299,6 +2391,7 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
     func saveDraftNow() {
         saveTimer?.invalidate()
         saveTimer = nil
+        guard !discarded else { return }
         let items = attachments.compactMap { attachment -> Store.Draft.Item? in
             guard let path = attachment.remotePath else { return nil }  // 还没传完的不存
             switch attachment.kind {
@@ -2309,12 +2402,15 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
             }
         }
         // 翻历史时存的是开始翻之前自己写的内容，不是正显示的历史消息
-        Store.saveDraft(.init(text: historyIndex == nil ? textView.string : historyStash, items: items))
-        Store.pruneThumbnails(keeping: Set(attachments.compactMap(\.thumbnailFile)))
+        let draft = Store.Draft(text: historyIndex == nil ? textView.string : historyStash, items: items)
+        Store.saveTerminal(targetID, .init(draft: draft, history: history))
+        Store.pruneThumbnails()
     }
 
-    private func restoreDraft() {
-        guard let draft = Store.loadDraft() else { return }
+    private func restore(_ state: Store.TerminalState?) {
+        guard let state else { return }
+        history = state.history
+        let draft = state.draft
         textView.string = draft.text
         textView.setSelectedRange(NSRange(location: (draft.text as NSString).length, length: 0))
         for item in draft.items where Date().timeIntervalSince(item.created) < draftAttachmentMaxAge {
@@ -2353,13 +2449,19 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
               !promises.isEmpty else { return false }
         let destination = FileManager.default.temporaryDirectory.appendingPathComponent("cc-composer-drops/\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        // 对方导出文件可能要好几秒（iCloud 里的照片要先下载）：先放一个“准备中”的占位，
+        // 它和上传中的附件一样会让发送等着，免得文字先发出去、附件落到下一条
         for promise in promises {
+            let name = promise.fileNames.first ?? "准备中…"
+            let placeholder = makeAttachment(.file(name: name), preview: fileIcon(name))
             promise.receivePromisedFiles(atDestination: destination, options: [:], operationQueue: .main) { [weak self] url, error in
                 MainActor.assumeIsolated {
+                    guard let self, self.attachments.contains(where: { $0 === placeholder }) else { return }  // 准备期间被删掉了
                     if let error {
-                        self?.refreshHint(error: "拿不到拖进来的文件：\(error.localizedDescription)")
+                        self.finishUpload(placeholder, .failure(UploadError(message: "拿不到拖进来的文件：\(error.localizedDescription)")))
                     } else {
-                        self?.add([ImageUploader.item(forFile: url)])
+                        self.add([ImageUploader.item(forFile: url)])
+                        self.removeAttachment(placeholder)  // 先加真的再删占位，中间不会出现“没有附件在传”而提前发出去
                     }
                 }
             }
@@ -2596,21 +2698,114 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
     }
 }
 
+// MARK: - 所有输入框
+
+/// 每个 Ghostty 终端（含分屏）一个输入框，草稿和历史各管各的。每个窗口可以各开一个；
+/// 同一个窗口里同时只显示一个（换到另一个分屏的输入框时，原来那个收起，草稿留着）。
+/// 终端关掉（或 Ghostty 退出）后，它的输入框连同草稿、历史一起清掉。⌥Space 和“焦点在终端时的 Esc”由这里分派
+@MainActor
+final class ComposerHub {
+    private var composers: [String: Composer] = [:]  // 终端编号 → 输入框
+    private let bridge = GhosttyBridge.shared
+    private var escKey: HotKey!
+    private var escTarget: Composer?
+    private var watchTimer: Timer?
+
+    init() {
+        escKey = HotKey(id: 2, keyCode: escKeyCode, modifiers: 0) { [weak self] in self?.escTarget?.dismiss() }
+        CommandState.shared.onChange = { [weak self] in self?.composers.values.forEach { $0.commandsChanged() } }
+    }
+
+    /// ⌥Space：打开当前聚焦终端的输入框；它已经在用（焦点在里面）就收起。openOnly：菜单栏里点的，只打开
+    func toggle(openOnly: Bool = false) {
+        let info = bridge.targetInfo()
+        pruneClosedTerminals()
+        let composer = composer(for: info?.id ?? "")
+        if composer.isFocused && !openOnly {
+            composer.dismiss()
+            return
+        }
+        let window = GhosttyWindow.frontID()
+        for other in composers.values where other !== composer && other.isOpen && other.windowID == window { other.close() }
+        composer.present(name: info?.name ?? "")
+    }
+
+    private func composer(for id: String) -> Composer {
+        if let existing = composers[id] { return existing }
+        let state = Store.loadTerminal(id) ?? (id.isEmpty ? nil : Store.takeLegacy())
+        let composer = Composer(terminalID: id, state: state)
+        composer.onStateChange = { [weak self] in self?.refresh() }
+        composers[id] = composer
+        return composer
+    }
+
+    /// 已经关掉的终端：收起它的输入框，草稿和历史一起删掉。拿不到终端列表（Ghostty 没开、没授权）时什么都不动
+    private func pruneClosedTerminals() {
+        guard let alive = bridge.terminalIDs() else { return }
+        for (id, composer) in composers where !id.isEmpty && !alive.contains(id) {
+            composer.discard()
+            composers[id] = nil
+        }
+        for id in Store.storedTerminalIDs() where id != "unknown" && !alive.contains(id) { Store.deleteTerminal(id) }
+        Store.pruneThumbnails()
+    }
+
+    /// 焦点、前台窗口、打开收起变了：重新决定 Esc 拦不拦——只有前台 Ghostty 窗口上有变暗的输入框时才拦，
+    /// 拦下的 Esc 只收起那个输入框。有输入框开着时，每秒看一次它们的终端还在不在
+    func refresh() {
+        let ghosttyActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == ghosttyBundleID
+        let front = ghosttyActive ? GhosttyWindow.frontID() : nil
+        escTarget = front == nil ? nil : composers.values.first { $0.isOpen && $0.isUnfocused && $0.windowID == front }
+        if escTarget != nil { escKey.register() } else { escKey.unregister() }
+        let anyOpen = composers.values.contains { $0.isOpen }
+        if anyOpen && watchTimer == nil {
+            watchTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.watchTerminals() }
+            }
+        } else if !anyOpen {
+            watchTimer?.invalidate()
+            watchTimer = nil
+        }
+    }
+
+    /// 关分屏、关标签页都要在 Ghostty 里操作，所以只在 Ghostty 在前台、没在输入框里打字时查（一次脚本调用）
+    private func watchTerminals() {
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == ghosttyBundleID,
+              !composers.values.contains(where: \.isFocused) else { return }
+        pruneClosedTerminals()
+        refresh()
+    }
+
+    func frontAppChanged() {
+        composers.values.forEach { $0.frontAppChanged() }
+        refresh()
+    }
+
+    /// 首次运行时触发一次“自动化”授权弹窗（Ghostty 没开就跳过，免得把它拉起来）
+    func warmUp() {
+        _ = bridge.targetInfo()
+    }
+
+    func saveAll() {
+        composers.values.forEach { $0.saveDraftNow() }
+    }
+}
+
 // MARK: - 应用
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let composer = Composer()
+    private let hub = ComposerHub()
     private var hotKey: HotKey!
     private var statusItem: NSStatusItem!
     private var openItem: NSMenuItem!
 
     func applicationWillTerminate(_ notification: Notification) {
-        composer.saveDraftNow()
+        hub.saveAll()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        hotKey = HotKey(id: 1, keyCode: hotKeyCode, modifiers: hotKeyModifiers) { [unowned self] in self.composer.toggle() }
+        hotKey = HotKey(id: 1, keyCode: hotKeyCode, modifiers: hotKeyModifiers) { [unowned self] in self.hub.toggle() }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "square.and.pencil", accessibilityDescription: "cc-composer")
@@ -2626,11 +2821,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
         updateHotKey(for: NSWorkspace.shared.frontmostApplication)
 
-        composer.warmUp()
+        hub.warmUp()
     }
 
     @objc private func openComposer() {
-        composer.present()
+        hub.toggle(openOnly: true)
     }
 
     @objc private func frontAppChanged(_ notification: Notification) {
@@ -2638,7 +2833,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 快捷键只在 Ghostty 处于前台时注册，其他应用里 ⌥Space 照常可用。
-    /// 切到别的应用时输入框不收起（比如要从访达拖文件进来），由 Composer 调整层级
+    /// 切到别的应用时输入框不收起（比如要从访达拖文件进来），由各个输入框调整层级
     private func updateHotKey(for app: NSRunningApplication?) {
         if app?.bundleIdentifier == ghosttyBundleID {
             let ok = hotKey.register()
@@ -2648,7 +2843,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if app?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             hotKey.unregister()
         }
-        composer.frontAppChanged()
+        hub.frontAppChanged()
     }
 }
 
@@ -2748,19 +2943,40 @@ func selfTest() -> Int32 {
 
     check(ImageUploader.safeName("a b\"$`\\/c.txt") == "a_b_____c.txt", "文件名里的特殊字符换成 _：\(ImageUploader.safeName("a b\"$`\\/c.txt"))")
     check(ImageUploader.safeName("报告 2026.pdf") == "报告_2026.pdf", "中文文件名保留")
+    let sneaky = "report\"\u{0301};id;#.txt"  // 引号后面跟组合符号：按字符看是一个“字符”，按码点看还是引号
+    check(!ImageUploader.safeName(sneaky).unicodeScalars.contains("\""), "引号加组合符号也会被换掉")
+    let script = ImageUploader.uploadScript(remotePath: "files/x/" + sneaky)
+    check(!script.contains("report") && !script.contains(";id;")
+          && script.contains(Data(("files/x/" + sneaky).utf8).base64EncodedString()), "文件名不进 shell 源码（base64 传过去）")
 
-    // 草稿和历史存到临时目录
+    // 草稿和历史存到临时目录，按终端分开
     Store.directory = tmp.appendingPathComponent("store")
-    Store.saveDraft(.init(text: "草稿内容", items: [.init(kind: "file", remotePath: "/x/report.pdf", name: "report.pdf", created: Date())]))
-    let draft = Store.loadDraft()
-    check(draft?.text == "草稿内容" && draft?.items.first?.name == "report.pdf", "草稿存取")
+    Store.saveTerminal("AAAA-1", .init(draft: .init(text: "草稿内容", items: [.init(kind: "file", remotePath: "/x/report.pdf",
+                                                                                  name: "report.pdf", created: Date())]),
+                                     history: ["发过的"]))
+    let stored = Store.loadTerminal("AAAA-1")
+    check(stored?.draft.text == "草稿内容" && stored?.draft.items.first?.name == "report.pdf" && stored?.history == ["发过的"]
+          && Store.loadTerminal("BBBB-2") == nil && Store.storedTerminalIDs() == ["AAAA-1"], "草稿和历史按终端存取")
     let saved = (try? Data(contentsOf: png)).flatMap { Store.saveImage($0, ext: "png") }
     check(saved.flatMap(Store.thumbnail) != nil, "草稿图片存取")
+    Store.legacyForTest(draft: .init(text: "旧草稿", items: []), history: ["旧历史"])
+    let legacy = Store.takeLegacy()
+    check(legacy?.draft.text == "旧草稿" && legacy?.history == ["旧历史"] && Store.takeLegacy() == nil, "旧版的共用草稿交给第一个终端，只交一次")
+    Store.deleteTerminal("AAAA-1")
+    check(Store.storedTerminalIDs().isEmpty, "终端关了：删掉它的草稿和历史")
+
+    // 两个终端的输入框互不影响
+    let first = Composer(terminalID: "CCCC-3", state: nil), second = Composer(terminalID: "DDDD-4", state: nil)
+    first.setTextForTest("给第一个终端的")
+    first.saveDraftNow()
+    second.saveDraftNow()
+    check(Store.loadTerminal("CCCC-3")?.draft.text == "给第一个终端的" && Store.loadTerminal("DDDD-4")?.draft.text == "",
+          "两个终端各有各的草稿")
+    first.discard()
+    second.discard()
 
     // ↑/↓：历史两条（第二条有两行），正在写“正在写的草稿”
-    Store.saveHistory(["第一条", "第二条\n第二行"])
-    Store.saveDraft(.init(text: "", items: []))
-    let composer = Composer()
+    let composer = Composer(terminalID: "EEEE-5", state: .init(history: ["第一条", "第二条\n第二行"]))
     composer.setTextForTest("正在写的草稿")
     let up = #selector(NSResponder.moveUp(_:)), down = #selector(NSResponder.moveDown(_:))
     check(composer.commandForTest(up) == (true, "第二条\n第二行"), "↑ 翻到最近一条")
@@ -2776,11 +2992,10 @@ func selfTest() -> Int32 {
     let config = Config.parse("""
         # 注释
         ssh_host = myvps   # 行尾注释
-        remote_dir = ~/uploads
         label.my-skill = 我的 skill
         """)
-    check(config.sshHost == "myvps" && config.remoteDir == "$HOME/uploads" && config.labels == ["my-skill": "我的 skill"]
-          && Config.parse("").remoteDir == "$HOME/.cache/cc-composer", "配置文件：ssh_host / remote_dir / label.xxx")
+    check(config.sshHost == "myvps" && config.labels == ["my-skill": "我的 skill"] && Config.parse("").sshHost.isEmpty,
+          "配置文件：ssh_host / label.xxx")
 
     // 斜杠命令：用一份假的 Claude Code 命令表
     let reported: [String: Any] = [
@@ -2860,8 +3075,7 @@ func selfTest() -> Int32 {
     check(SlashCompleter.suggestions(for: "/resume bbb-2", in: withSessions).isEmpty, "会话 ID 填好了：列表收起")
 
     // 输入框里：Tab 补全命令 → 接着列选项 → ↓ 选 → Tab 补全选项；Esc 先关列表
-    Store.saveHistory(["/clear", "/compact"])
-    let commander = Composer()
+    let commander = Composer(terminalID: "FFFF-6", state: .init(history: ["/clear", "/compact"]))
     commander.setTextForTest("")
     commander.typeForTest("/eff")
     check(commander.suggestionsForTest.first == "/effort", "打 /eff 弹出 /effort")
