@@ -60,8 +60,10 @@ struct Config {
     var sshHost = ""
     var labels: [String: String] = [:]
 
+    nonisolated(unsafe) static var overrideForTest: Config?
+
     static func load() -> Config {
-        parse((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
+        overrideForTest ?? parse((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
     }
 
     static func parse(_ text: String) -> Config {
@@ -1839,6 +1841,8 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
     private var followTimer: Timer?
 
     var isFocused: Bool { panel.isVisible && panel.isKeyWindow }
+    /// 键盘在这个输入框或它的放大预览上：这时 Esc 要留给它们自己（关命令列表、取消输入法选字、关预览）
+    var holdsKeyboard: Bool { isFocused || imagePreview.isVisible }
     /// 开着但焦点在终端（变暗的状态）：这时在终端里按 Esc 只收起它
     var isUnfocused: Bool { panel.isVisible && !panel.isKeyWindow && !imagePreview.isVisible }
 
@@ -2447,26 +2451,49 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
         // “照片”“邮件”之类拖出来的是待生成的文件：先让对方写到临时目录，再当普通文件处理
         guard let promises = pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self]) as? [NSFilePromiseReceiver],
               !promises.isEmpty else { return false }
+        acceptPromises(promises)
+        return true
+    }
+
+    /// 一个待生成文件的承诺可能包含好几个文件，回调按文件一个个来
+    private final class PromiseBatch {
+        var remaining: Int
+        var finished = false  // 这一批到齐了、占位是我们自己删的（之后多来的文件照收）
+        var failure: String?
+        init(expecting count: Int) { remaining = max(count, 1) }
+    }
+
+    /// 对方导出文件可能要好几秒（iCloud 里的照片要先下载）：每个承诺先放一个“准备中”的占位，
+    /// 它和上传中的附件一样会让发送等着，免得文字先发出去、附件落到下一条。这一批文件到齐后再删占位
+    func acceptPromises(_ promises: [NSFilePromiseReceiver]) {
         let destination = FileManager.default.temporaryDirectory.appendingPathComponent("cc-composer-drops/\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        // 对方导出文件可能要好几秒（iCloud 里的照片要先下载）：先放一个“准备中”的占位，
-        // 它和上传中的附件一样会让发送等着，免得文字先发出去、附件落到下一条
         for promise in promises {
-            let name = promise.fileNames.first ?? "准备中…"
-            let placeholder = makeAttachment(.file(name: name), preview: fileIcon(name))
+            let names = promise.fileNames
+            let name = names.count > 1 ? "\(names.count) 个文件准备中…" : names.first ?? "准备中…"
+            let placeholder = makeAttachment(.file(name: name), preview: fileIcon(names.first ?? ""))
+            let batch = PromiseBatch(expecting: names.count)
             promise.receivePromisedFiles(atDestination: destination, options: [:], operationQueue: .main) { [weak self] url, error in
                 MainActor.assumeIsolated {
-                    guard let self, self.attachments.contains(where: { $0 === placeholder }) else { return }  // 准备期间被删掉了
+                    guard let self else { return }
+                    let waiting = self.attachments.contains { $0 === placeholder }
+                    if !waiting && !batch.finished { return }  // 准备期间用户删掉了占位：这一批都不要了
                     if let error {
-                        self.finishUpload(placeholder, .failure(UploadError(message: "拿不到拖进来的文件：\(error.localizedDescription)")))
+                        batch.failure = "拿不到拖进来的文件：\(error.localizedDescription)"
                     } else {
                         self.add([ImageUploader.item(forFile: url)])
-                        self.removeAttachment(placeholder)  // 先加真的再删占位，中间不会出现“没有附件在传”而提前发出去
+                    }
+                    batch.remaining -= 1
+                    guard waiting, batch.remaining <= 0 else { return }  // 还没到齐：占位留着，发送继续等
+                    batch.finished = true
+                    if let failure = batch.failure {
+                        self.finishUpload(placeholder, .failure(UploadError(message: failure)))
+                    } else {
+                        self.removeAttachment(placeholder)  // 真文件已经加上了，中间不会出现“没有附件在传”而提前发出去
                     }
                 }
             }
         }
-        return true
     }
 
     private func add(_ items: [Incoming]) {
@@ -2670,6 +2697,10 @@ final class Composer: NSObject, NSTextViewDelegate, DropHandler {
 
     var suggestionsForTest: [String] { completion.items.map(\.title) }
 
+    var attachmentNamesForTest: [String] {
+        attachments.map { if case .file(let name) = $0.kind { name } else { "图片" } }
+    }
+
     func moveCaretForTest(to location: Int) {
         textView.setSelectedRange(NSRange(location: location, length: 0))
     }
@@ -2750,12 +2781,31 @@ final class ComposerHub {
         Store.pruneThumbnails()
     }
 
-    /// 焦点、前台窗口、打开收起变了：重新决定 Esc 拦不拦——只有前台 Ghostty 窗口上有变暗的输入框时才拦，
-    /// 拦下的 Esc 只收起那个输入框。有输入框开着时，每秒看一次它们的终端还在不在
+    /// 在终端里按 Esc 时要不要拦、拦给谁：只拦前台 Ghostty 窗口上那个变暗的输入框；
+    /// 但只要键盘在任何一个输入框（或预览、快速查看）上，就谁都不拦，Esc 留给它们自己
+    struct EscCandidate {
+        var isOpen: Bool
+        var isUnfocused: Bool
+        var holdsKeyboard: Bool
+        var windowID: CGWindowID?
+    }
+
+    static func escTarget(_ candidates: [EscCandidate], frontWindow: CGWindowID?, quickLookOpen: Bool) -> Int? {
+        guard let frontWindow, !quickLookOpen, !candidates.contains(where: \.holdsKeyboard) else { return nil }
+        return candidates.firstIndex { $0.isOpen && $0.isUnfocused && $0.windowID == frontWindow }
+    }
+
+    /// 焦点、前台窗口、打开收起变了：重新决定 Esc 拦不拦，拦下的 Esc 只收起那个输入框。
+    /// 有输入框开着时，每秒看一次它们的终端还在不在
     func refresh() {
         let ghosttyActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == ghosttyBundleID
-        let front = ghosttyActive ? GhosttyWindow.frontID() : nil
-        escTarget = front == nil ? nil : composers.values.first { $0.isOpen && $0.isUnfocused && $0.windowID == front }
+        let list = Array(composers.values)
+        let candidates = list.map {
+            EscCandidate(isOpen: $0.isOpen, isUnfocused: $0.isUnfocused, holdsKeyboard: $0.holdsKeyboard, windowID: $0.windowID)
+        }
+        let quickLookOpen = QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
+        escTarget = Self.escTarget(candidates, frontWindow: ghosttyActive ? GhosttyWindow.frontID() : nil, quickLookOpen: quickLookOpen)
+            .map { list[$0] }
         if escTarget != nil { escKey.register() } else { escKey.unregister() }
         let anyOpen = composers.values.contains { $0.isOpen }
         if anyOpen && watchTimer == nil {
@@ -2949,8 +2999,9 @@ func selfTest() -> Int32 {
     check(!script.contains("report") && !script.contains(";id;")
           && script.contains(Data(("files/x/" + sneaky).utf8).base64EncodedString()), "文件名不进 shell 源码（base64 传过去）")
 
-    // 草稿和历史存到临时目录，按终端分开
+    // 草稿和历史存到临时目录，按终端分开；整个自检都用空配置，后台的上传不会连到真的远程机器
     Store.directory = tmp.appendingPathComponent("store")
+    Config.overrideForTest = Config()
     Store.saveTerminal("AAAA-1", .init(draft: .init(text: "草稿内容", items: [.init(kind: "file", remotePath: "/x/report.pdf",
                                                                                   name: "report.pdf", created: Date())]),
                                      history: ["发过的"]))
@@ -2974,6 +3025,25 @@ func selfTest() -> Int32 {
           "两个终端各有各的草稿")
     first.discard()
     second.discard()
+
+    // Esc：键盘在别的输入框上时不拦（两个窗口各开一个，点进不在前台的那个窗口的输入框）
+    let dimmedOnFront = ComposerHub.EscCandidate(isOpen: true, isUnfocused: true, holdsKeyboard: false, windowID: 2)
+    let typingElsewhere = ComposerHub.EscCandidate(isOpen: true, isUnfocused: false, holdsKeyboard: true, windowID: 1)
+    check(ComposerHub.escTarget([dimmedOnFront], frontWindow: 2, quickLookOpen: false) == 0
+          && ComposerHub.escTarget([dimmedOnFront], frontWindow: 1, quickLookOpen: false) == nil
+          && ComposerHub.escTarget([dimmedOnFront], frontWindow: nil, quickLookOpen: false) == nil,
+          "Esc 只拦前台 Ghostty 窗口上变暗的输入框")
+    check(ComposerHub.escTarget([typingElsewhere, dimmedOnFront], frontWindow: 2, quickLookOpen: false) == nil
+          && ComposerHub.escTarget([dimmedOnFront], frontWindow: 2, quickLookOpen: true) == nil,
+          "键盘在别的输入框（或快速查看）上时，Esc 谁都不拦")
+
+    // 一个文件承诺里有两个文件：两个都收到，占位到齐后删掉
+    let dropTarget = Composer(terminalID: "GGGG-7", state: nil)
+    let promised = [tmp.appendingPathComponent("甲.txt"), tmp.appendingPathComponent("乙.txt")]
+    for url in promised { try? Data("x".utf8).write(to: url) }
+    dropTarget.acceptPromises([FakePromise(urls: promised)])
+    check(dropTarget.attachmentNamesForTest == ["甲.txt", "乙.txt"], "一个承诺里的几个文件都收到：\(dropTarget.attachmentNamesForTest)")
+    dropTarget.discard()
 
     // ↑/↓：历史两条（第二条有两行），正在写“正在写的草稿”
     let composer = Composer(terminalID: "EEEE-5", state: .init(history: ["第一条", "第二条\n第二行"]))
@@ -3115,6 +3185,25 @@ func renderCommands(_ text: String, to path: String) -> Int32 {
     try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
     print("\(view.items.count) 条，画到 \(path)")
     return 0
+}
+
+/// 自检用：假装是“照片”之类的程序给的文件承诺，回调立刻按顺序给出这些文件
+final class FakePromise: NSFilePromiseReceiver {
+    private let urls: [URL]
+
+    init(urls: [URL]) {
+        self.urls = urls
+        super.init()
+    }
+
+    required init?(pasteboardPropertyList propertyList: Any, ofType type: NSPasteboard.PasteboardType) { nil }
+
+    override var fileNames: [String] { urls.map(\.lastPathComponent) }
+
+    override func receivePromisedFiles(atDestination destinationDir: URL, options: [AnyHashable: Any] = [:],
+                                       operationQueue: OperationQueue, reader: @escaping (URL, (any Error)?) -> Void) {
+        for url in urls { reader(url, nil) }
+    }
 }
 
 /// --commands：从 VPS 取一次命令表（会更新本地缓存）和 /resume 的会话列表，打印出来
