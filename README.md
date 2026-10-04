@@ -24,7 +24,7 @@ SSH 延迟一高，在远程的 Claude Code 里打字就会一顿一顿的，中
 
 ## 需要
 
-- macOS 和 Xcode 命令行工具（要用 `swiftc` 编译；没装的话运行 `xcode-select --install`）
+- macOS 26 或更新
 - Ghostty 1.3 或更新（用到它的 AppleScript 接口）
 - 远程机器：Linux，Mac 能用 SSH 密钥免密登录；装了 Claude Code（`claude` 在 PATH 里或在 `~/.local/bin`）和 python3
 
@@ -32,20 +32,33 @@ SSH 延迟一高，在远程的 Claude Code 里打字就会一顿一顿的，中
 
 ## 安装
 
+### 下载编译好的
+
+到 [Releases](https://github.com/AAzzAAzzAAzzAA/cc-composer/releases) 下载 `cc-composer.zip`，解压后把 `cc-composer.app` 放进“应用程序”文件夹打开。想开机自启的话，在“系统设置 → 通用 → 登录项”里加上它。
+
+- 只支持 Apple 芯片（M 系列），需要 macOS 26 或更新
+- 没有苹果开发者签名
+
+### 自己编译
+
+需要 Xcode 命令行工具（没装的话运行 `xcode-select --install`）。
+
 ```sh
 git clone https://github.com/AAzzAAzzAAzzAA/cc-composer.git
 cd cc-composer
 ./build.sh --autostart   # 编译，装到 ~/Applications，启动，并设成登录后自动启动
 ```
 
-然后告诉它远程机器是哪台（写你在 `~/.ssh/config` 里的主机别名，或者 `user@host`）：
+### 配置远程机器
+
+装好以后，告诉它远程机器是哪台（写你在 `~/.ssh/config` 里的主机别名，或者 `user@host`）：
 
 ```sh
 mkdir -p ~/.config/cc-composer
 echo "ssh_host = myvps" > ~/.config/cc-composer/config
 ```
 
-第一次发送时 macOS 会问“cc-composer 想控制 Ghostty”，点允许。应用是本地签名的，每次重新编译后都会再问一次。
+第一次发送时 macOS 会问“cc-composer 想控制 Ghostty”，点允许。自己编译的话，每次重新编译后都会再问一次。
 
 只想要本地输入、不传图片也不用命令补全的话，可以不配 `ssh_host`：文字照样能送进 Ghostty 里的任何程序。
 
